@@ -1,0 +1,231 @@
+#include <ESP8266WiFi.h>
+#include <ESP8266HTTPClient.h>
+#include <WiFiClientSecure.h>
+#include <Wire.h>
+#include <SPI.h>
+#include <SD.h>
+#include <Adafruit_PN532.h>
+
+// ====== ALTERE AQUI ======
+const char* WIFI_SSID = "Weimer";
+const char* WIFI_PASS = "marcos1234";
+const char* API_URL = "https://logtrack-self.vercel.app/api/nfc";
+const char* API_KEY = "log_track";
+// ==========================
+
+// D2 = GPIO4 | D1 = GPIO5
+#define SDA_PN532 4
+#define SCL_PN532 5
+
+// D0 = GPIO16
+#define RESET_PN532 16
+
+// D8 = GPIO15
+#define SD_CS 15
+
+// LED interno da NodeMCU: D4 = GPIO2
+#define LED_PIN 2
+
+// GPIO0 é usado apenas pela biblioteca; não ligar o IRQ do PN532.
+#define IRQ_PN532 0
+
+Adafruit_PN532 nfc(IRQ_PN532, RESET_PN532);
+
+bool sdPronto = false;
+String ultimoUID = "";
+unsigned long ultimaLeitura = 0;
+unsigned long ultimaFila = 0;
+
+void piscarLED() {
+  for (int i = 0; i < 5; i++) {
+    digitalWrite(LED_PIN, LOW);
+    delay(180);
+
+    digitalWrite(LED_PIN, HIGH);
+    delay(180);
+  }
+}
+
+bool conectarWiFi() {
+  if (WiFi.status() == WL_CONNECTED) {
+    return true;
+  }
+
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+
+  unsigned long inicio = millis();
+
+  while (WiFi.status() != WL_CONNECTED && millis() - inicio < 10000) {
+    delay(300);
+  }
+
+  return WiFi.status() == WL_CONNECTED;
+}
+
+bool enviarSite(String dados) {
+  if (!conectarWiFi()) {
+    return false;
+  }
+
+  WiFiClientSecure client;
+  client.setInsecure();
+
+  HTTPClient http;
+
+  if (!http.begin(client, API_URL)) {
+    return false;
+  }
+
+  http.addHeader("Content-Type", "application/json");
+  http.addHeader("Authorization", "Bearer " + String(API_KEY));
+
+  int resposta = http.POST(dados);
+  http.end();
+
+  return resposta >= 200 && resposta < 300;
+}
+
+void salvarNoCartao(String dados) {
+  if (!sdPronto) {
+    return;
+  }
+
+  File arquivo = SD.open("/fila.txt", FILE_WRITE);
+
+  if (arquivo) {
+    arquivo.println(dados);
+    arquivo.close();
+  }
+}
+
+void enviarPendentes() {
+  if (!sdPronto || WiFi.status() != WL_CONNECTED) {
+    return;
+  }
+
+  if (!SD.exists("/fila.txt")) {
+    return;
+  }
+
+  SD.remove("/temp.txt");
+
+  File entrada = SD.open("/fila.txt", FILE_READ);
+  File temp = SD.open("/temp.txt", FILE_WRITE);
+
+  if (!entrada || !temp) {
+    if (entrada) entrada.close();
+    if (temp) temp.close();
+    return;
+  }
+
+  while (entrada.available()) {
+    String linha = entrada.readStringUntil('\n');
+    linha.trim();
+
+    if (linha.length() > 0 && !enviarSite(linha)) {
+      temp.println(linha);
+    }
+  }
+
+  entrada.close();
+  temp.close();
+
+  SD.remove("/fila.txt");
+
+  File verificar = SD.open("/temp.txt", FILE_READ);
+  bool aindaTemDados = verificar && verificar.size() > 0;
+
+  if (verificar) verificar.close();
+
+  if (aindaTemDados) {
+    SD.rename("/temp.txt", "/fila.txt");
+  } else {
+    SD.remove("/temp.txt");
+  }
+}
+
+String converterUID(uint8_t* uid, uint8_t tamanho) {
+  String codigo = "";
+
+  for (uint8_t i = 0; i < tamanho; i++) {
+    if (uid[i] < 16) {
+      codigo += "0";
+    }
+
+    codigo += String(uid[i], HEX);
+  }
+
+  codigo.toUpperCase();
+  return codigo;
+}
+
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(LED_PIN, OUTPUT);
+  digitalWrite(LED_PIN, HIGH);
+
+  Wire.begin(SDA_PN532, SCL_PN532);
+
+  sdPronto = SD.begin(SD_CS);
+
+  nfc.begin();
+
+  if (!nfc.getFirmwareVersion()) {
+    Serial.println("PN532 nao encontrado.");
+
+    while (true) {
+      delay(1000);
+    }
+  }
+
+  nfc.SAMConfig();
+
+  conectarWiFi();
+
+  Serial.println("Leitor pronto.");
+}
+
+void loop() {
+  if (millis() - ultimaFila > 15000) {
+    enviarPendentes();
+    ultimaFila = millis();
+  }
+
+  uint8_t uid[7];
+  uint8_t tamanhoUID;
+
+  bool encontrado = nfc.readPassiveTargetID(
+    PN532_MIFARE_ISO14443A,
+    uid,
+    &tamanhoUID,
+    500
+  );
+
+  if (!encontrado) {
+    return;
+  }
+
+  String cartao = converterUID(uid, tamanhoUID);
+
+  if (cartao == ultimoUID && millis() - ultimaLeitura < 2000) {
+    return;
+  }
+
+  ultimoUID = cartao;
+  ultimaLeitura = millis();
+
+  piscarLED();
+
+  String dados = "{";
+  dados += "\"dispositivo\":\"leitor-nfc-01\",";
+  dados += "\"uid\":\"" + cartao + "\"";
+  dados += "}";
+
+  if (enviarSite(dados)) {
+    Serial.println("Enviado: " + cartao);
+  } else {
+    salvarNoCartao(dados);
+    Serial.println("Salvo no cartao: " + cartao);
+  }
+}

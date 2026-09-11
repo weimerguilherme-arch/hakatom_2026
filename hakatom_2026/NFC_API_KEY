@@ -1,0 +1,45 @@
+import { NextRequest, NextResponse } from "next/server";
+
+export async function POST(request: NextRequest) {
+  const autorizacao = request.headers.get("authorization");
+
+  if (autorizacao !== `Bearer ${process.env.NFC_API_KEY}`) {
+    return NextResponse.json(
+      { ok: false, mensagem: "Chave incorreta." },
+      { status: 401 }
+    );
+  }
+
+  try {
+    const dados = await request.json();
+
+    if (!dados.uid) {
+      return NextResponse.json(
+        { ok: false, mensagem: "Cartão não informado." },
+        { status: 400 }
+      );
+    }
+
+    const leitura = {
+      uid: String(dados.uid).toUpperCase(),
+      dispositivo: String(dados.dispositivo || "leitor-nfc-01"),
+      recebidoEm: new Date().toISOString(),
+    };
+
+    console.log("CARTÃO RECEBIDO:", leitura);
+
+    return NextResponse.json(
+      {
+        ok: true,
+        mensagem: "Cartão recebido.",
+        leitura,
+      },
+      { status: 200 }
+    );
+  } catch {
+    return NextResponse.json(
+      { ok: false, mensagem: "Erro ao ler os dados." },
+      { status: 400 }
+    );
+  }
+}
